@@ -524,7 +524,14 @@ class MPClient(EngineCoreClient):
                         "Timed out waiting for engines to send"
                         "initial message on input socket."
                     )
-                identity, _ = sync_input_socket.recv_multipart()
+                identity, msg = sync_input_socket.recv_multipart()
+                ready_msg = msgspec.msgpack.decode(msg)
+                if "num_cpu_blocks" in ready_msg:
+                    self.vllm_config.cache_config.num_cpu_blocks = ready_msg[
+                        "num_cpu_blocks"]
+                if "num_gpu_blocks" in ready_msg:
+                    self.vllm_config.cache_config.num_gpu_blocks = ready_msg[
+                        "num_gpu_blocks"]
                 identities.remove(identity)
 
             self.core_engine: EngineIdentity = self.core_engines[0]
