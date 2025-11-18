@@ -737,6 +737,26 @@ class EngineCoreProc(EngineCore):
 
             # Send ready message.
             num_gpu_blocks = vllm_config.cache_config.num_gpu_blocks
+            num_cpu_blocks = vllm_config.cache_config.num_cpu_blocks
+
+            if num_cpu_blocks is None:
+                # num_cpu_blocks should be set in EngineCore.__init__.
+                # If it is None, it means the initialization logic didn't run
+                # as expected or failed to update the config.
+                # We try to recover from the extra config if available.
+                if (
+                    vllm_config.kv_transfer_config is not None
+                    and "num_cpu_blocks"
+                    in vllm_config.kv_transfer_config.kv_connector_extra_config
+                ):
+                    num_cpu_blocks = (
+                        vllm_config.kv_transfer_config.kv_connector_extra_config[
+                            "num_cpu_blocks"
+                        ]
+                    )
+                else:
+                    num_cpu_blocks = 0
+
             # We pass back the coordinator stats update address here for the
             # external LB case for our colocated front-end to use (coordinator
             # only runs with rank 0).
@@ -748,6 +768,7 @@ class EngineCoreProc(EngineCore):
                 "local": local_client,
                 "headless": headless,
                 "num_gpu_blocks": num_gpu_blocks,
+                "num_cpu_blocks": num_cpu_blocks,
                 "dp_stats_address": dp_stats_address,
             }
             if vllm_config.parallel_config.data_parallel_size > 1:
