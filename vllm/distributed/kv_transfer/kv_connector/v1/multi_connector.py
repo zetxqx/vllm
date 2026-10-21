@@ -212,9 +212,7 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
 
     @property
     def supports_divergent_local_hybrid_hits(self) -> bool:
-        return bool(self._connectors) and all(
-            c.supports_divergent_local_hybrid_hits for c in self._connectors
-        )
+        return any(c.supports_divergent_local_hybrid_hits for c in self._connectors)
 
     @property
     def requires_kv_delivery(self) -> bool:
@@ -452,9 +450,14 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
         self,
         request: "Request",
         num_computed_tokens: int,
+        *,
+        divergent_local_hit: bool = False,
     ) -> tuple[int | None, bool]:
         to_return = (0, False)
         for i, c in enumerate(self._connectors):
+            # Only capable connectors can complete a divergent local hit.
+            if divergent_local_hit and not c.supports_divergent_local_hybrid_hits:
+                continue
             toks, load_async = c.get_num_new_matched_tokens(
                 request, num_computed_tokens
             )
