@@ -26,6 +26,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
+from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import MultiConnector
 from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
@@ -1124,11 +1125,41 @@ class Scheduler(SchedulerInterface):
                         block_aligned_local = (
                             num_new_local_computed_tokens - partial_tail
                         )
-                        ext_tokens, load_kv_async = (
-                            self.connector.get_num_new_matched_tokens(
-                                request, block_aligned_local
+                        connector = self.connector
+                        if hit_diverged and isinstance(connector, MultiConnector):
+                            ext_tokens, load_kv_async = (
+                                connector.get_num_new_matched_tokens(
+                                    request,
+                                    block_aligned_local,
+                                    divergent_local_hit=True,
+                                )
                             )
-                        )
+                            if ext_tokens == 0:
+                                # No capable sub-connector backs the deeper local
+                                # hit: reconcile, then query all sub-connectors.
+                                hit_diverged = False
+                                (
+                                    new_computed_blocks,
+                                    num_new_local_computed_tokens,
+                                    request.shared_prefix_boundary,
+                                ) = self.kv_cache_manager.get_computed_blocks(request)
+                                partial_tail = (
+                                    num_new_local_computed_tokens % self.block_size
+                                )
+                                block_aligned_local = (
+                                    num_new_local_computed_tokens - partial_tail
+                                )
+                                ext_tokens, load_kv_async = (
+                                    connector.get_num_new_matched_tokens(
+                                        request, block_aligned_local
+                                    )
+                                )
+                        else:
+                            ext_tokens, load_kv_async = (
+                                connector.get_num_new_matched_tokens(
+                                    request, block_aligned_local
+                                )
+                            )
                         if request.skip_reading_prefix_cache:
                             ext_tokens, load_kv_async = 0, False
 

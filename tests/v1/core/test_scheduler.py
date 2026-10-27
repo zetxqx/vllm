@@ -7925,6 +7925,7 @@ def _create_hybrid_mamba_connector_scheduler(
     block_size: int = 16,
     num_blocks: int = 100,
     supports_divergent_hits: bool = True,
+    kv_transfer_config: KVTransferConfig | None = None,
 ) -> Scheduler:
     """FA + Mamba ("align" cache mode) scheduler with a MockKVConnector."""
     model_config = ModelConfig(
@@ -7949,7 +7950,8 @@ def _create_hybrid_mamba_connector_scheduler(
             enable_prefix_caching=True,
             mamba_cache_mode="align",
         ),
-        kv_transfer_config=KVTransferConfig(
+        kv_transfer_config=kv_transfer_config
+        or KVTransferConfig(
             kv_connector="MockKVConnector",
             kv_role="kv_both",
             kv_connector_extra_config={
@@ -8156,6 +8158,76 @@ def test_hybrid_fa_deeper_hit_respects_connector_lookup_policy(
     )
     assert per_group_hits == (4 * block_size, 1 * block_size)  # FA deeper
 
+    scheduler.add_request(replay)
+    output = scheduler.schedule()
+    [new_req] = output.scheduled_new_reqs
+    assert new_req.num_computed_tokens == expected_num_computed
+
+
+@pytest.mark.parametrize(
+    ("capable_matched", "incapable_matched", "expected_num_computed"),
+    [
+        # Capable sub-connector matches at the deep FA boundary (64 + 16 = 80).
+        (16, 16, 80),
+        # Capable misses at 64; scheduler reconciles to 16 and queries all
+        # sub-connectors at the consistent boundary (16 + 16 = 32).
+        (0, 16, 32),
+        # Both miss; scheduler reconciles to the consistent boundary (16).
+        (0, 0, 16),
+    ],
+)
+def test_hybrid_fa_deeper_hit_with_multi_connector(
+    capable_matched: int,
+    incapable_matched: int,
+    expected_num_computed: int,
+):
+    """MultiConnector queries only capable sub-connectors at a divergent FA
+    boundary, and falls back to all sub-connectors at the reconciled
+    common boundary when no capable sub-connector matches.
+    """
+    block_size = 16
+    scheduler = _create_hybrid_mamba_connector_scheduler(
+        0,
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="MultiConnector",
+            kv_role="kv_both",
+            kv_connector_extra_config={
+                "connectors": [
+                    {
+                        "kv_connector": "MockKVConnector",
+                        "kv_role": "kv_both",
+                        "kv_connector_extra_config": {
+                            "matched_tokens": incapable_matched,
+                            "is_async": False,
+                            "supports_divergent_local_hybrid_hits": False,
+                        },
+                    },
+                    {
+                        "kv_connector": "MockKVConnector",
+                        "kv_role": "kv_both",
+                        "kv_connector_extra_config": {
+                            "matched_tokens": capable_matched,
+                            "is_async": False,
+                            "supports_divergent_local_hybrid_hits": True,
+                        },
+                    },
+                ]
+            },
+        ),
+    )
+
+    manager = scheduler.kv_cache_manager
+    _, mamba_ids = _seed_hybrid_prefix(manager, 4, block_size)
+    manager.block_pool.evict_blocks({mamba_ids[1], mamba_ids[2], mamba_ids[3]})
+
+    [replay] = create_requests(
+        num_requests=1,
+        num_tokens=6 * block_size,
+        max_tokens=1,
+        same_prompt=True,
+        block_size=block_size,
+        req_ids=["replay"],
+    )
     scheduler.add_request(replay)
     output = scheduler.schedule()
     [new_req] = output.scheduled_new_reqs

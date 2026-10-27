@@ -1222,14 +1222,35 @@ def test_multi_connector_hma_support_detection():
     assert mc_mixed2._all_support_hma is False
 
 
-def test_divergent_local_hybrid_hit_capability_is_conservative():
+def test_divergent_local_hybrid_hit_capability_and_filtering():
     all_supported = _make_multi_connector(
         ["MockDivergentHMAConnector", "MockDivergentHMAConnector"]
     )
     assert all_supported.supports_divergent_local_hybrid_hits is True
 
     mixed = _make_multi_connector(["MockDivergentHMAConnector", "MockHMAConnector"])
-    assert mixed.supports_divergent_local_hybrid_hits is False
+    assert mixed.supports_divergent_local_hybrid_hits is True
+
+    none_supported = _make_multi_connector(["MockHMAConnector", "MockHMAConnector"])
+    assert none_supported.supports_divergent_local_hybrid_hits is False
+
+    request = MagicMock(request_id="req-divergent")
+    capable, incapable = mixed._connectors
+    capable.get_num_new_matched_tokens.return_value = (0, False)
+    incapable.get_num_new_matched_tokens.return_value = (16, True)
+
+    # At a divergent local hit, only capable sub-connectors are queried.
+    assert mixed.get_num_new_matched_tokens(request, 64, divergent_local_hit=True) == (
+        0,
+        False,
+    )
+    capable.get_num_new_matched_tokens.assert_called_once_with(request, 64)
+    incapable.get_num_new_matched_tokens.assert_not_called()
+
+    # Otherwise all sub-connectors are queried.
+    assert mixed.get_num_new_matched_tokens(request, 16) == (16, True)
+    incapable.get_num_new_matched_tokens.assert_called_once_with(request, 16)
+    assert mixed._requests_to_connector[request.request_id] == 1
 
 
 @pytest.mark.skipif(
