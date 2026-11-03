@@ -61,6 +61,7 @@ if TYPE_CHECKING:
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_USE_FUSED_MQA_TOPK: bool = True
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
+    VLLM_SPARSE_INDEXER_MAX_DECODE_LOGITS_MB: int = 2048
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
     VLLM_XPU_PP_MICROBATCH: bool = True
     VLLM_DISTRIBUTED_USE_SPLIT_GROUP: bool = False
@@ -247,6 +248,7 @@ if TYPE_CHECKING:
     VLLM_EC_SIDE_CHANNEL_PORT: int = 0
     VLLM_MOONCAKE_BOOTSTRAP_PORT: int = 8998
     VLLM_MOONCAKE_STORE_TIER_LOG: bool = False
+    VLLM_MOONCAKE_STORE_SELECTIVE_LEASE: bool = False
     VLLM_MOONCAKE_LOAD_RECV_THREADS: int = 1
     VLLM_MOONCAKE_DISK_STAGING_USABLE_RATIO: float = 0.9
     MOONCAKE_PREFERRED_SEGMENT: str | None = None
@@ -326,6 +328,7 @@ if TYPE_CHECKING:
     VLLM_WEIGHT_OFFLOADING_DISABLE_UVA: bool = False
     VLLM_RELOAD_MODE: Literal["layerwise", "direct"] = "layerwise"
     VLLM_KV_OFFLOAD_MAX_BATCH_DESCRIPTORS: int = 0
+    VLLM_KV_OFFLOAD_MAX_LOAD_SUBMIT_DESCRIPTORS: int = 8192
     VLLM_WSL2_ENABLE_PIN_MEMORY: bool = False
     VLLM_DISABLE_LOG_LOGO: bool = False
     VLLM_LORA_DISABLE_PDL: bool = False
@@ -1132,6 +1135,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB": lambda: int(
         os.getenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", "512")
     ),
+    # Per-chunk BF16 decode logits budget (MiB) for the SM100 sparse indexer;
+    # 0 disables decode chunking.
+    "VLLM_SPARSE_INDEXER_MAX_DECODE_LOGITS_MB": lambda: int(
+        os.getenv("VLLM_SPARSE_INDEXER_MAX_DECODE_LOGITS_MB", "2048")
+    ),
     # KV context length each adaptive-verification profiling request pretends to
     # carry, so the profiled step reads a realistic amount of cache.
     # Raise it for long-context deployments, where step cost is dominated by
@@ -1835,6 +1843,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MOONCAKE_STORE_TIER_LOG": lambda: (
         os.getenv("VLLM_MOONCAKE_STORE_TIER_LOG", "False").lower() in ("true", "1")
     ),
+    # Probe prefix-lookup keys without a read lease and lease only the keys the
+    # hit loads. Requires Mooncake >= 0.3.14.
+    "VLLM_MOONCAKE_STORE_SELECTIVE_LEASE": lambda: (
+        os.getenv("VLLM_MOONCAKE_STORE_SELECTIVE_LEASE", "False").lower()
+        in ("true", "1")
+    ),
     # Number of parallel KV-load receive threads per worker rank. Lets the
     # per-request control overhead (Python prep + master key lookup) of one
     # request overlap with the RDMA transfer of another, keeping the transfer
@@ -2265,6 +2279,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # rocm 7.14/7.15 when batch copy is optimized; CUDA uncapped). Set >0 to override.
     "VLLM_KV_OFFLOAD_MAX_BATCH_DESCRIPTORS": lambda: int(
         os.getenv("VLLM_KV_OFFLOAD_MAX_BATCH_DESCRIPTORS", "0")
+    ),
+    # Max copy descriptors an async CPU-KV-offload load submits per engine step;
+    # the rest go out on later steps. One batch-memcpy call with more
+    # descriptors than the GPU command queue holds blocks the worker thread
+    # until the copy engine drains it, stalling the next model step. 0 = submit
+    # each load in one call.
+    "VLLM_KV_OFFLOAD_MAX_LOAD_SUBMIT_DESCRIPTORS": lambda: int(
+        os.getenv("VLLM_KV_OFFLOAD_MAX_LOAD_SUBMIT_DESCRIPTORS", "8192")
     ),
     # On WSL2 with a compatible kernel (>= 4.19.121), pinned memory is
     # supported but disabled by default due to a small performance regression.

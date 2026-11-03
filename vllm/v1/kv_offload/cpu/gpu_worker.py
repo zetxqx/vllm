@@ -4,25 +4,25 @@ import functools
 import time
 from collections import deque
 from collections.abc import Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import NamedTuple
 
 import numpy as np
 import torch
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, triton
-from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.kv_offload.base import (
     BlockIDsLoadStoreSpec,
     CanonicalKVCacheRef,
     CanonicalKVCaches,
     CanonicalPageMapping,
-    GPULoadStoreSpec,
+    DevicePointers,
     LoadStoreSpec,
     OffloadingWorker,
     TransferResult,
@@ -33,6 +33,7 @@ from vllm.v1.kv_offload.cpu.swap_blocks_triton import (
     THRESHOLD_BYTES,
     swap_blocks_batch,
 )
+from vllm.v1.kv_offload.pointer_utils import iter_pointer_groups
 
 logger = init_logger(__name__)
 
@@ -87,6 +88,24 @@ class Transfer:
     batch_dst: torch.Tensor
     batch_sizes: torch.Tensor
     failed: bool = False
+    # start_event/end_event time the last (or only) submitted slice; these are
+    # the (start, end) events of the slices submitted before it
+    prior_events: list[tuple[torch.Event, torch.Event]] = field(default_factory=list)
+
+
+@dataclass
+class _PendingTransfer:
+    """A job whose copy descriptors are not all submitted yet."""
+
+    job_id: int
+    stream: torch.cuda.Stream
+    num_bytes: int
+    num_ops: int
+    batch_src: torch.Tensor
+    batch_dst: torch.Tensor
+    batch_sizes: torch.Tensor
+    next_op: int = 0
+    prior_events: list[tuple[torch.Event, torch.Event]] = field(default_factory=list)
 
 
 def compute_sub_block_ptrs(
@@ -298,77 +317,55 @@ class SingleDirectionOffloadingHandler:
     Transfers are guaranteed to be executed in order of their submission.
     Each transfer uses a unique CUDA stream, and its stream will start
     executing only after the streams of previous transfers have finished.
+
+    With max_descriptors_per_submit > 0, at most that many copy descriptors are
+    handed to the driver per call; the rest of a job is submitted by later
+    transfer_async / get_finished calls (one per engine step). A single
+    cuMemcpyBatchAsync call with more descriptors than the GPU command queue
+    holds blocks the calling thread until the copy engine drains it, which
+    stalls the worker's next model step for about the whole copy.
     """
 
     def __init__(
         self,
-        gpu_tensors: list[torch.Tensor],
         cpu_tensors: list[torch.Tensor],
         blocks_per_chunk: int,
         layer_refs_per_group: list[list[CanonicalKVCacheRef]],
         gpu_to_cpu: bool,
         canonical_layout: bool = False,
         host_memory_is_pinned: bool = True,
+        max_descriptors_per_submit: int = 0,
     ):
         """Initialize a SingleDirectionOffloadingHandler.
 
         Args:
-            gpu_tensors: list of GPU KV cache tensors.
-                Each of shape (num_gpu_blocks, gpu_page_size_bytes) with dtype int8.
             cpu_tensors: list of CPU KV cache tensors.
-                Each of shape (num_cpu_chunks, cpu_page_size_bytes) with dtype int8.
-                Order should match gpu_tensors.
-            blocks_per_chunk: number of blocks transferred per chunk.
+                Each of shape (num_cpu_blocks, cpu_page_size_bytes) with dtype int8.
+            blocks_per_chunk: number of GPU blocks per CPU chunk.
             layer_refs_per_group: list of CanonicalKVCacheRef per group.
             gpu_to_cpu: if True, transfer from GPU to CPU; otherwise CPU to GPU.
             canonical_layout: if True, CPU pages use the canonical layout
                 described by the refs' mappings.
             host_memory_is_pinned: whether the CPU tensors are pinned, so GPU
                 kernels may dereference them directly.
+            max_descriptors_per_submit: cap on the copy descriptors submitted
+                per call; 0 submits every job in a single call.
 
         """
-        assert len(gpu_tensors) == len(cpu_tensors)
-        assert len(gpu_tensors) > 0
+        assert len(cpu_tensors) > 0
 
-        canonical_bytes_per_block = (
-            _canonical_block_sizes(layer_refs_per_group, len(gpu_tensors))
-            if canonical_layout
-            else None
-        )
-
-        # assert input tensors are as expected
-        for t_idx, (gpu_tensor, cpu_tensor) in enumerate(zip(gpu_tensors, cpu_tensors)):
-            assert gpu_tensor.dtype == torch.int8
-            assert gpu_tensor.ndim == 2
-            assert gpu_tensor.is_cuda or gpu_tensor.is_xpu
+        for cpu_tensor in cpu_tensors:
             assert cpu_tensor.dtype == torch.int8
             assert cpu_tensor.ndim == 2
             assert cpu_tensor.device.type == "cpu"
-            _, gpu_page_size = gpu_tensor.shape
-            _, cpu_page_size = cpu_tensor.shape
-            if canonical_bytes_per_block is not None:
-                assert (
-                    cpu_page_size == canonical_bytes_per_block[t_idx] * blocks_per_chunk
-                )
-            else:
-                assert cpu_page_size == gpu_page_size * blocks_per_chunk
 
-        self.src_tensors: list[torch.Tensor] = (
-            gpu_tensors if gpu_to_cpu else cpu_tensors
-        )
-        self.dst_tensors: list[torch.Tensor] = (
-            cpu_tensors if gpu_to_cpu else gpu_tensors
-        )
+        self.cpu_tensors = cpu_tensors
         self.gpu_to_cpu: bool = gpu_to_cpu
         self.layer_refs_per_group = layer_refs_per_group
         self._swap_blocks_batch = _select_swap_blocks_fn(
             layer_refs_per_group, gpu_to_cpu, host_memory_is_pinned
         )
-
-        # GPU blocks may be smaller
-        # cpu_page_size = gpu_page_size * blocks_per_chunk.
-        self.src_blocks_per_chunk = 1 if self.gpu_to_cpu else blocks_per_chunk
-        self.dst_blocks_per_chunk = blocks_per_chunk if self.gpu_to_cpu else 1
+        self.blocks_per_chunk = blocks_per_chunk
 
         # Per (group, ref) static copy plans for the canonical layout
         self._canonical_copy_plans: list[list[CopyPlan]] | None = (
@@ -384,14 +381,16 @@ class SingleDirectionOffloadingHandler:
         )
         # Reusable per-block base-pointer scratch for the canonical fill,
         # sized to the largest possible group (grown on demand)
-        num_scratch_blocks = gpu_tensors[0].shape[0] if canonical_layout else 0
-        self._scratch_bases_src = np.empty(num_scratch_blocks, dtype=np.uint64)
-        self._scratch_bases_dst = np.empty(num_scratch_blocks, dtype=np.uint64)
+        num_scratch_blocks = cpu_tensors[0].shape[0] if canonical_layout else 0
+        self._scratch_bases_cpu = np.empty(num_scratch_blocks, dtype=np.uint64)
 
         # job_id -> event
         self._transfer_events: dict[int, torch.Event] = {}
         # queue of transfers (job_id, stream, event)
         self._transfers: deque[Transfer] = deque()
+        # jobs with descriptors left to submit, in submission order
+        self.max_descriptors_per_submit = max_descriptors_per_submit
+        self._pending: deque[_PendingTransfer] = deque()
         # list of CUDA streams available for re-use
         self._stream_pool: list[torch.cuda.Stream] = []
         # list of CUDA events available for re-use
@@ -419,11 +418,11 @@ class SingleDirectionOffloadingHandler:
     def _fill_direct_ops(
         self,
         g_idx: int,
-        group_src: np.ndarray,
-        group_dst: np.ndarray,
+        device_ptrs: DevicePointers,
+        dev_ptr_offset: int,
+        cpu_block_ids: np.ndarray,
         group_size: int,
-        src_skip_count: int,
-        dst_skip_count: int,
+        cpu_skip_count: int,
         all_src: np.ndarray,
         all_dst: np.ndarray,
         all_sizes: np.ndarray,
@@ -434,25 +433,23 @@ class SingleDirectionOffloadingHandler:
 
         Returns (op_idx past the filled descriptors, bytes added)."""
         num_bytes = 0
-        for data_ref in self.layer_refs_per_group[g_idx]:
+        for d, data_ref in enumerate(self.layer_refs_per_group[g_idx]):
             t_idx = data_ref.tensor_idx
             end_idx = op_idx + group_size
 
-            compute_sub_block_ptrs(
-                group_src,
-                self.src_blocks_per_chunk,
-                all_src[op_idx:end_idx],
-                self.src_tensors[t_idx],
-                skip_count=src_skip_count,
+            ptr_start = dev_ptr_offset + d * group_size
+            gpu_ptrs = device_ptrs.ptrs[ptr_start : ptr_start + group_size]
+            gpu_out, cpu_out = (
+                (all_src, all_dst) if self.gpu_to_cpu else (all_dst, all_src)
             )
+            gpu_out[op_idx:end_idx] = gpu_ptrs
             compute_sub_block_ptrs(
-                group_dst,
-                self.dst_blocks_per_chunk,
-                all_dst[op_idx:end_idx],
-                self.dst_tensors[t_idx],
-                skip_count=dst_skip_count,
+                cpu_block_ids,
+                self.blocks_per_chunk,
+                cpu_out[op_idx:end_idx],
+                self.cpu_tensors[t_idx],
+                skip_count=cpu_skip_count,
             )
-
             all_sizes[op_idx:end_idx] = data_ref.page_size_bytes
             num_bytes += group_size * data_ref.page_size_bytes
             op_idx = end_idx
@@ -461,11 +458,11 @@ class SingleDirectionOffloadingHandler:
     def _fill_canonical_ops(
         self,
         g_idx: int,
-        group_src: np.ndarray,
-        group_dst: np.ndarray,
+        device_ptrs: DevicePointers,
+        dev_ptr_offset: int,
+        cpu_block_ids: np.ndarray,
         group_size: int,
-        src_skip_count: int,
-        dst_skip_count: int,
+        cpu_skip_count: int,
         all_src: np.ndarray,
         all_dst: np.ndarray,
         all_sizes: np.ndarray,
@@ -481,35 +478,38 @@ class SingleDirectionOffloadingHandler:
         # buffers' int64 are bit-equivalent for addresses
         all_src_u64 = all_src.view(np.uint64)
         all_dst_u64 = all_dst.view(np.uint64)
-        if group_size > len(self._scratch_bases_src):
-            self._scratch_bases_src = np.empty(group_size, dtype=np.uint64)
-            self._scratch_bases_dst = np.empty(group_size, dtype=np.uint64)
+        if group_size > len(self._scratch_bases_cpu):
+            self._scratch_bases_cpu = np.empty(group_size, dtype=np.uint64)
 
         num_bytes = 0
-        for plan, data_ref in zip(
-            self._canonical_copy_plans[g_idx], self.layer_refs_per_group[g_idx]
+        for d, (plan, data_ref) in enumerate(
+            zip(
+                self._canonical_copy_plans[g_idx],
+                self.layer_refs_per_group[g_idx],
+            )
         ):
             if plan.num_frags == 0:
                 continue
             t_idx = data_ref.tensor_idx
 
             # 1. Base byte pointer of every block on each side
-            block_bases_src = self._scratch_bases_src[:group_size]
-            block_bases_dst = self._scratch_bases_dst[:group_size]
+            ptr_start = dev_ptr_offset + d * group_size
+            gpu_bases = device_ptrs.ptrs[ptr_start : ptr_start + group_size]
+            cpu_bases = self._scratch_bases_cpu[:group_size]
             compute_sub_block_ptrs(
-                group_src,
-                self.src_blocks_per_chunk,
-                block_bases_src,
-                self.src_tensors[t_idx],
-                skip_count=src_skip_count,
+                cpu_block_ids,
+                self.blocks_per_chunk,
+                cpu_bases,
+                self.cpu_tensors[t_idx],
+                skip_count=cpu_skip_count,
             )
-            compute_sub_block_ptrs(
-                group_dst,
-                self.dst_blocks_per_chunk,
-                block_bases_dst,
-                self.dst_tensors[t_idx],
-                skip_count=dst_skip_count,
-            )
+
+            if self.gpu_to_cpu:
+                block_bases_src = gpu_bases
+                block_bases_dst = cpu_bases
+            else:
+                block_bases_src = cpu_bases
+                block_bases_dst = gpu_bases
 
             # 2. On store, keep only the blocks this rank is elected to write
             mapping = data_ref.mapping
@@ -519,9 +519,9 @@ class SingleDirectionOffloadingHandler:
                     block_bases_src,
                     block_bases_dst,
                     mapping,
-                    group_dst,
+                    cpu_block_ids,
                     group_size,
-                    dst_skip_count,
+                    cpu_skip_count,
                 )
             num_active_blocks = len(block_bases_src)
 
@@ -556,66 +556,33 @@ class SingleDirectionOffloadingHandler:
         block_bases_src: np.ndarray,
         block_bases_dst: np.ndarray,
         mapping: CanonicalPageMapping,
-        group_dst: np.ndarray,
+        cpu_block_ids: np.ndarray,
         group_size: int,
-        dst_skip_count: int,
+        cpu_skip_count: int,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Keep only the blocks this rank writes: replicated ranks take turns
         writing shared canonical pages, keyed by the rank-consistent CPU-side
         canonical page id."""
         cpu_page_ids = _canonical_page_ids(
-            group_dst,
-            self.dst_blocks_per_chunk,
+            cpu_block_ids,
+            self.blocks_per_chunk,
             group_size,
-            dst_skip_count,
+            cpu_skip_count,
         )
         writer_mask = cpu_page_ids % mapping.num_writers == mapping.writer_index
         return block_bases_src[writer_mask], block_bases_dst[writer_mask]
 
     def transfer_async(
-        self, job_id: int, src_spec: LoadStoreSpec, dst_spec: LoadStoreSpec
+        self,
+        job_id: int,
+        device_ptrs: DevicePointers,
+        cpu_spec: BlockIDsLoadStoreSpec,
     ) -> bool:
-        assert isinstance(src_spec, BlockIDsLoadStoreSpec)
-        assert isinstance(dst_spec, BlockIDsLoadStoreSpec)
+        cpu_blocks = cpu_spec.block_ids
+        assert cpu_blocks.ndim == 1
+        num_cpu_blocks = len(cpu_blocks)
 
-        src_blocks = src_spec.block_ids
-        dst_blocks = dst_spec.block_ids
-        assert src_blocks.ndim == 1
-        assert dst_blocks.ndim == 1
-
-        num_src_blocks = len(src_blocks)
-        num_dst_blocks = len(dst_blocks)
-
-        # There are 2 types of transfers:
-        # 1. GPU -> CPU
-        # 2. CPU -> GPU
-        #
-        # transfers are also to CPU chunks, EXCEPT MAYBE for the first and last chunk.
-        # i.e. the first and last CPU chunks in src_blocks can match against
-        # a smaller (byte-wise) set of GPU blocks in dst_blocks.
-        # In such cases, we may need to skip some gpu-sized sub-blocks,
-        # and start reading/writing from the middle of the first CPU chunk.
-        # If we have multiple KV cache groups (when using HMA with hybrid models),
-        # we may have a partial first/last CPU chunk per each group.
-        # The group_sizes parameter encodes the size of each group of blocks
-        # in the GPU dst_blocks.
-        # If group_sizes is None, we assume all blocks belong to a single group.
-        # The logical_offset parameter maps each group of blocks to its logical
-        # offset inside the request, counting in GPU blocks.
-        # This allows us to find the correct starting position
-        # in the matching first CPU chunk.
-
-        # extract group_sizes from the GPU spec
-        gpu_spec = src_spec if self.gpu_to_cpu else dst_spec
-        assert isinstance(gpu_spec, GPULoadStoreSpec)
-        group_sizes = gpu_spec.group_sizes
-        assert len(group_sizes) == len(self.layer_refs_per_group)
-
-        # extract block indices from the GPU spec
-        block_indices = gpu_spec.block_indices
-        assert len(block_indices) == len(self.layer_refs_per_group)
-
-        num_copy_ops = self._estimate_max_copy_ops(group_sizes)
+        num_copy_ops = self._estimate_max_copy_ops(device_ptrs.group_block_counts)
 
         # reuse a pooled buffer set, growing it if this transfer needs more room
         batch_src, batch_dst, batch_sizes = (
@@ -633,70 +600,36 @@ class SingleDirectionOffloadingHandler:
         all_dst = dst.numpy()
         all_sizes = sizes.numpy()
 
-        src_offset = 0
-        dst_offset = 0
+        cpu_offset = 0
         op_idx = 0
-        # count total number of bytes copied
         num_transfer_bytes = 0
-        for g_idx, (group_size, block_idx) in enumerate(
-            zip(group_sizes, block_indices)
-        ):
-            if group_size == 0:
-                continue
-
-            src_logical_blocks_to_skip = block_idx % self.src_blocks_per_chunk
-            dst_logical_blocks_to_skip = block_idx % self.dst_blocks_per_chunk
-            src_logical_blocks_count = group_size + src_logical_blocks_to_skip
-            dst_logical_blocks_count = group_size + dst_logical_blocks_to_skip
-
-            dst_blocks_count = cdiv(dst_logical_blocks_count, self.dst_blocks_per_chunk)
-            dst_end_offset = dst_offset + dst_blocks_count
-            assert dst_end_offset <= num_dst_blocks
-
-            src_blocks_count = cdiv(src_logical_blocks_count, self.src_blocks_per_chunk)
-            src_end_offset = src_offset + src_blocks_count
-            assert src_end_offset <= num_src_blocks
+        for g in iter_pointer_groups(device_ptrs, self.blocks_per_chunk):
+            cpu_end_offset = cpu_offset + g.n_chunks
+            assert cpu_end_offset <= num_cpu_blocks
 
             op_idx, group_bytes = self._fill_group_ops(
-                g_idx,
-                group_src=src_blocks[src_offset:src_end_offset],
-                group_dst=dst_blocks[dst_offset:dst_end_offset],
-                group_size=group_size,
-                src_skip_count=src_logical_blocks_to_skip,
-                dst_skip_count=dst_logical_blocks_to_skip,
+                g.group_idx,
+                device_ptrs=device_ptrs,
+                dev_ptr_offset=g.dev_ptr_offset,
+                cpu_block_ids=cpu_blocks[cpu_offset:cpu_end_offset],
+                group_size=g.group_size,
+                cpu_skip_count=g.skip,
                 all_src=all_src,
                 all_dst=all_dst,
                 all_sizes=all_sizes,
                 op_idx=op_idx,
             )
             num_transfer_bytes += group_bytes
+            cpu_offset = cpu_end_offset
 
-            src_offset = src_end_offset
-            dst_offset = dst_end_offset
-
-        assert src_offset == num_src_blocks
-        assert dst_offset == num_dst_blocks
+        assert cpu_offset == num_cpu_blocks
         # Writer rotation may skip non-writer blocks, leaving op_idx below
         # the sized upper bound
         assert op_idx <= num_copy_ops
-        src = src[:op_idx]
-        dst = dst[:op_idx]
-        sizes = sizes[:op_idx]
 
         stream = (
             self._stream_pool.pop() if self._stream_pool else current_platform.Stream()
         )
-        start_event = (
-            self._event_pool.pop()
-            if self._event_pool
-            else torch.Event(enable_timing=True)
-        )
-        end_event = (
-            self._event_pool.pop()
-            if self._event_pool
-            else torch.Event(enable_timing=True)
-        )
-
         # Stores must wait for the model to finish writing the KV they read.
         # Loads must wait for pending writes (including zeroing) to their
         # destination blocks: the scheduler leaves a block unzeroed only in
@@ -704,83 +637,119 @@ class SingleDirectionOffloadingHandler:
         # shipped in an earlier step for a since-reallocated block; with async
         # scheduling nothing else orders that zeroing against this copy.
         stream.wait_stream(current_platform.current_stream())
-        if self._transfers:
-            last_transfer: Transfer = self._transfers[-1]
-            last_event = last_transfer.end_event
-            # assure job will start only after the previous one completes
-            stream.wait_event(last_event)
-        # CPU->GPU reads from host memory, which is never written
-        # by a concurrent GPU stream, so CU_MEMCPY_SRC_ACCESS_ORDER_ANY is
-        # safe and lets the driver pipeline source reads. GPU->CPU reads
-        # from the live GPU KV cache, which the compute stream keeps
-        # writing; we must keep STREAM ordering so source reads are gated
-        # by the transfer stream's wait_stream(compute) barrier.
-        is_src_access_order_any = not self.gpu_to_cpu
-        try:
-            with current_platform.stream(stream):
-                start_event.record(stream)
-                if op_idx > 0:
-                    self._swap_blocks_batch(
-                        src,
-                        dst,
-                        sizes,
-                        is_src_access_order_any=is_src_access_order_any,
-                    )
-                end_event.record(stream)
-        except RuntimeError:
-            _clear_pending_device_error()
-            logger.exception(
-                "KV offload %s transfer failed for job %d",
-                "GPU->CPU" if self.gpu_to_cpu else "CPU->GPU",
-                job_id,
-            )
-            end_event.record(stream)
-            self._transfer_events[job_id] = end_event
-            self._transfers.append(
-                Transfer(
-                    job_id=job_id,
-                    stream=stream,
-                    start_event=start_event,
-                    end_event=end_event,
-                    num_bytes=0,
-                    batch_src=batch_src,
-                    batch_dst=batch_dst,
-                    batch_sizes=batch_sizes,
-                    failed=True,
-                )
-            )
-            return True
-
-        self._transfer_events[job_id] = end_event
-        self._transfers.append(
-            Transfer(
+        self._pending.append(
+            _PendingTransfer(
                 job_id=job_id,
                 stream=stream,
-                start_event=start_event,
-                end_event=end_event,
                 num_bytes=num_transfer_bytes,
+                num_ops=op_idx,
                 batch_src=batch_src,
                 batch_dst=batch_dst,
                 batch_sizes=batch_sizes,
             )
         )
+        self._submit_pending(self.max_descriptors_per_submit)
 
         # success
         return True
 
+    def _submit_pending(self, budget: int) -> None:
+        """Submit pending jobs in order, at most `budget` descriptors in total.
+
+        Args:
+            budget: descriptor cap for this call; 0 submits everything pending.
+
+        """
+        unbounded = budget <= 0
+        while self._pending and (unbounded or budget > 0):
+            job = self._pending[0]
+            if job.next_op == 0 and self._transfers:
+                last_transfer: Transfer = self._transfers[-1]
+                last_event = last_transfer.end_event
+                # assure job will start only after the previous one completes
+                job.stream.wait_event(last_event)
+
+            begin = job.next_op
+            end = job.num_ops if unbounded else min(job.num_ops, begin + budget)
+            budget -= end - begin
+            start_event = (
+                self._event_pool.pop()
+                if self._event_pool
+                else torch.Event(enable_timing=True)
+            )
+            end_event = (
+                self._event_pool.pop()
+                if self._event_pool
+                else torch.Event(enable_timing=True)
+            )
+            # CPU->GPU reads from host memory, which is never written
+            # by a concurrent GPU stream, so CU_MEMCPY_SRC_ACCESS_ORDER_ANY is
+            # safe and lets the driver pipeline source reads. GPU->CPU reads
+            # from the live GPU KV cache, which the compute stream keeps
+            # writing; we must keep STREAM ordering so source reads are gated
+            # by the transfer stream's wait_stream(compute) barrier.
+            is_src_access_order_any = not self.gpu_to_cpu
+            failed = False
+            try:
+                with current_platform.stream(job.stream):
+                    start_event.record(job.stream)
+                    if end > begin:
+                        self._swap_blocks_batch(
+                            job.batch_src[begin:end],
+                            job.batch_dst[begin:end],
+                            job.batch_sizes[begin:end],
+                            is_src_access_order_any=is_src_access_order_any,
+                        )
+                    end_event.record(job.stream)
+            except RuntimeError:
+                _clear_pending_device_error()
+                logger.exception(
+                    "KV offload %s transfer failed for job %d",
+                    "GPU->CPU" if self.gpu_to_cpu else "CPU->GPU",
+                    job.job_id,
+                )
+                end_event.record(job.stream)
+                failed = True
+
+            if not failed and end < job.num_ops:
+                # the rest of the job is submitted by a later call
+                job.next_op = end
+                job.prior_events.append((start_event, end_event))
+                return
+
+            self._pending.popleft()
+            self._transfer_events[job.job_id] = end_event
+            self._transfers.append(
+                Transfer(
+                    job_id=job.job_id,
+                    stream=job.stream,
+                    start_event=start_event,
+                    end_event=end_event,
+                    num_bytes=0 if failed else job.num_bytes,
+                    batch_src=job.batch_src,
+                    batch_dst=job.batch_dst,
+                    batch_sizes=job.batch_sizes,
+                    failed=failed,
+                    prior_events=job.prior_events,
+                )
+            )
+
     def get_finished(self) -> list[TransferResult]:
+        if self._pending:
+            self._submit_pending(self.max_descriptors_per_submit)
         results: list[TransferResult] = []
         while self._transfers:
             transfer = self._transfers[0]
             try:
                 if not transfer.end_event.query():
                     break
-                transfer_time = (
-                    None
-                    if transfer.failed
+                transfer_time = None
+                if not transfer.failed:
                     # elapsed_time is in milliseconds
-                    else transfer.start_event.elapsed_time(transfer.end_event) * 1e-3
-                )
+                    elapsed_ms = transfer.start_event.elapsed_time(transfer.end_event)
+                    for start, end in transfer.prior_events:
+                        elapsed_ms += start.elapsed_time(end)
+                    transfer_time = elapsed_ms * 1e-3
             except RuntimeError:
                 logger.exception(
                     "KV offload %s transfer failed for job %d while polling "
@@ -810,12 +779,16 @@ class SingleDirectionOffloadingHandler:
             self._stream_pool.append(transfer.stream)
             self._event_pool.append(transfer.end_event)
             self._event_pool.append(transfer.start_event)
+            for start, end in transfer.prior_events:
+                self._event_pool.extend((end, start))
             self._buffer_pool.append(
                 (transfer.batch_src, transfer.batch_dst, transfer.batch_sizes)
             )
         return results
 
     def wait(self, job_ids: set[int]):
+        if any(job.job_id in job_ids for job in self._pending):
+            self._submit_pending(0)
         for job_id in job_ids:
             event = self._transfer_events.get(job_id)
             if event is not None:
@@ -830,6 +803,9 @@ class SingleDirectionOffloadingHandler:
 
     def shutdown(self) -> None:
         """Drain this direction and release its transfer-side resources."""
+        # A partly submitted job may have copies in flight; submit the rest so
+        # every job is drained below, as wait() does for the flush fence
+        self._submit_pending(0)
         sync_error: Exception | None = None
         while self._transfers:
             transfer = self._transfers[0]
@@ -850,8 +826,7 @@ class SingleDirectionOffloadingHandler:
         self._stream_pool.clear()
         self._event_pool.clear()
         self._buffer_pool.clear()
-        self.src_tensors.clear()
-        self.dst_tensors.clear()
+        self.cpu_tensors.clear()
         if sync_error is not None:
             raise sync_error
 
@@ -891,13 +866,9 @@ class CPUOffloadingWorker(OffloadingWorker):
             else None
         )
 
-        gpu_tensors: list[torch.Tensor] = []
         cpu_tensors: list[torch.Tensor] = []
         for t_idx, kv_cache_tensor in enumerate(kv_caches.tensors):
             gpu_page_size_bytes = kv_cache_tensor.page_size_bytes
-            gpu_tensor = kv_cache_tensor.tensor.view(torch.int8).view(
-                (-1, gpu_page_size_bytes)
-            )
             cpu_page_size_bytes = gpu_page_size_bytes * blocks_per_chunk
 
             if canonical_bytes_per_block is not None:
@@ -923,12 +894,10 @@ class CPUOffloadingWorker(OffloadingWorker):
                     time.monotonic() - t0,
                 )
 
-            gpu_tensors.append(gpu_tensor)
             cpu_tensors.append(cpu_tensor)
 
         make_handler = functools.partial(
             SingleDirectionOffloadingHandler,
-            gpu_tensors=gpu_tensors,
             cpu_tensors=cpu_tensors,
             blocks_per_chunk=blocks_per_chunk,
             layer_refs_per_group=kv_caches.group_data_refs,
@@ -936,26 +905,33 @@ class CPUOffloadingWorker(OffloadingWorker):
             host_memory_is_pinned=host_memory_is_pinned,
         )
         self._store_handler = make_handler(gpu_to_cpu=True)
-        self._load_handler = make_handler(gpu_to_cpu=False)
+        # Async loads may finish over several steps, so cap the descriptors
+        # each step submits instead of blocking the worker on one large batch.
+        self._load_handler = make_handler(
+            gpu_to_cpu=False,
+            max_descriptors_per_submit=envs.VLLM_KV_OFFLOAD_MAX_LOAD_SUBMIT_DESCRIPTORS,
+        )
         # Own stream, so expedited loads do not queue behind regular loads.
         self._expedited_load_handler = make_handler(gpu_to_cpu=False)
 
     def submit_store(
-        self, job_id: int, src_spec: GPULoadStoreSpec, dst_spec: LoadStoreSpec
+        self, job_id: int, device_ptrs: DevicePointers, dst_spec: LoadStoreSpec
     ) -> bool:
         """Async GPU -> CPU."""
-        return self._store_handler.transfer_async(job_id, src_spec, dst_spec)
+        assert isinstance(dst_spec, BlockIDsLoadStoreSpec)
+        return self._store_handler.transfer_async(job_id, device_ptrs, dst_spec)
 
     def submit_load(
         self,
         job_id: int,
         src_spec: LoadStoreSpec,
-        dst_spec: GPULoadStoreSpec,
+        device_ptrs: DevicePointers,
         expedited: bool = False,
     ) -> bool:
         """Async CPU -> GPU."""
+        assert isinstance(src_spec, BlockIDsLoadStoreSpec)
         handler = self._expedited_load_handler if expedited else self._load_handler
-        return handler.transfer_async(job_id, src_spec, dst_spec)
+        return handler.transfer_async(job_id, device_ptrs, src_spec)
 
     def get_finished(self) -> list[TransferResult]:
         return (

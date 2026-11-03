@@ -7,6 +7,7 @@ import time
 import uuid
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 import torch
 
@@ -18,6 +19,7 @@ from vllm.v1.kv_offload.base import (
     CanonicalKVCacheRef,
     CanonicalKVCaches,
     CanonicalKVCacheTensor,
+    DevicePointers,
     GPULoadStoreSpec,
     TransferResult,
 )
@@ -25,6 +27,7 @@ from vllm.v1.kv_offload.cpu import gpu_worker
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
+from vllm.v1.kv_offload.pointer_utils import resolve_device_pointers
 
 NUM_GPU_BLOCKS = [64]
 NUM_CPU_CHUNKS = [256]
@@ -186,11 +189,11 @@ def test_handler_shutdown_skips_transfers_after_event_sync_failure() -> None:
         ]
     )
     handler._transfer_events = {1: failed_event, 2: skipped_event}
+    handler._pending = gpu_worker.deque()
     handler._stream_pool = [MagicMock()]
     handler._event_pool = [MagicMock()]
     handler._buffer_pool = [(MagicMock(), MagicMock(), MagicMock())]
-    handler.src_tensors = [MagicMock()]
-    handler.dst_tensors = [MagicMock()]
+    handler.cpu_tensors = [MagicMock()]
 
     with pytest.raises(RuntimeError, match="device lost"):
         handler.shutdown()
@@ -201,8 +204,7 @@ def test_handler_shutdown_skips_transfers_after_event_sync_failure() -> None:
     assert not handler._stream_pool
     assert not handler._event_pool
     assert not handler._buffer_pool
-    assert not handler.src_tensors
-    assert not handler.dst_tensors
+    assert not handler.cpu_tensors
 
 
 def _bare_handler(gpu_to_cpu: bool = True):
@@ -213,6 +215,8 @@ def _bare_handler(gpu_to_cpu: bool = True):
     handler.gpu_to_cpu = gpu_to_cpu
     handler._transfers = gpu_worker.deque()
     handler._transfer_events = {}
+    handler.max_descriptors_per_submit = 0
+    handler._pending = gpu_worker.deque()
     handler._stream_pool = []
     handler._event_pool = []
     handler._buffer_pool = []
@@ -223,8 +227,7 @@ def _submittable_handler(monkeypatch: pytest.MonkeyPatch, gpu_to_cpu: bool = Tru
     """Bare handler wired up far enough to run transfer_async off-device."""
     handler = _bare_handler(gpu_to_cpu)
     handler.layer_refs_per_group = [MagicMock()]
-    handler.src_blocks_per_chunk = 1
-    handler.dst_blocks_per_chunk = 1
+    handler.blocks_per_chunk = 1
     handler._estimate_max_copy_ops = lambda group_sizes: 4
     handler._fill_group_ops = lambda g_idx, **kwargs: (1, 128)
     handler._swap_blocks_batch = MagicMock()
@@ -238,8 +241,15 @@ def _submittable_handler(monkeypatch: pytest.MonkeyPatch, gpu_to_cpu: bool = Tru
 
 
 def _submit(handler, job_id: int) -> bool:
-    spec = GPULoadStoreSpec(block_ids=[0], group_sizes=[1], block_indices=[0])
-    return handler.transfer_async(job_id, spec, spec)
+    device_ptrs = DevicePointers(
+        ptrs=np.zeros(1, dtype=np.uint64),
+        sizes=np.zeros(1, dtype=np.uint64),
+        group_block_counts=(1,),
+        group_data_ref_counts=(1,),
+        block_indices=(0,),
+    )
+    cpu_spec = CPULoadStoreSpec(block_ids=[0])
+    return handler.transfer_async(job_id, device_ptrs, cpu_spec)
 
 
 def test_submit_failure_is_not_reported_until_stream_drains(
@@ -352,9 +362,11 @@ def test_get_finished_reports_failure_when_event_query_raises() -> None:
     results = handler.get_finished()
 
     assert [(r.job_id, r.success) for r in results] == [(3, False), (4, True)]
+    assert results[1].transfer_time == 2.0 * 1e-3
     assert not handler._transfers
     assert not handler._transfer_events
     assert handler._stream_pool == [ready.stream]
+    assert handler._event_pool == [ready.end_event, ready.start_event]
     assert handler._buffer_pool == [
         (ready.batch_src, ready.batch_dst, ready.batch_sizes)
     ]
@@ -546,40 +558,40 @@ def test_transfer(
         gpu_blocks = gpu_blocks[blocks_to_skip:]
         cpu_chunks_expanded = cpu_chunks_expanded[blocks_to_skip:]
 
-    # set transfer direction
+    # build specs and resolve device pointers
+    gpu_spec = GPULoadStoreSpec(
+        gpu_blocks, group_sizes=(len(gpu_blocks),), block_indices=(blocks_to_skip,)
+    )
+    cpu_spec = CPULoadStoreSpec(cpu_chunks)
+    device_ptrs = resolve_device_pointers(gpu_spec, kv_caches)
+
+    handler = worker._store_handler if gpu_to_cpu else worker._load_handler
     if gpu_to_cpu:
-        handler = worker._store_handler
-        gpu_spec = GPULoadStoreSpec(
-            gpu_blocks, group_sizes=(len(gpu_blocks),), block_indices=(blocks_to_skip,)
-        )
-        cpu_spec = CPULoadStoreSpec(cpu_chunks)
         dst_to_src = dict(zip(cpu_chunks_expanded, gpu_blocks))
-        num_dst_sub_blocks = num_gpu_blocks
     else:
-        handler = worker._load_handler
-        cpu_spec = CPULoadStoreSpec(cpu_chunks)
-        gpu_spec = GPULoadStoreSpec(
-            gpu_blocks, group_sizes=(len(gpu_blocks),), block_indices=(blocks_to_skip,)
-        )
         dst_to_src = dict(zip(gpu_blocks, cpu_chunks_expanded))
-        num_dst_sub_blocks = num_gpu_blocks
+    num_dst_sub_blocks = num_gpu_blocks
 
-    # randomize src and dst tensors before transfer
-    for tensor in handler.src_tensors:
+    # collect gpu and cpu tensor lists for verification
+    gpu_tensors = [t.tensor for t in kv_caches.tensors]
+    cpu_tensors = handler.cpu_tensors
+
+    # randomize all tensors before transfer
+    for tensor in gpu_tensors:
         tensor.random_()
-    for tensor in handler.dst_tensors:
+    for tensor in cpu_tensors:
         tensor.random_()
 
-    # clone src and dst tensors before transfer
-    orig_src_tensors = [x.clone() for x in handler.src_tensors]
-    orig_dst_tensors = [x.clone() for x in handler.dst_tensors]
+    # clone tensors before transfer
+    orig_gpu_tensors = [x.clone() for x in gpu_tensors]
+    orig_cpu_tensors = [x.clone() for x in cpu_tensors]
 
     # call transfer function via public API
     start_time = time.time()
     if gpu_to_cpu:
-        assert worker.submit_store(1, gpu_spec, cpu_spec)
+        assert worker.submit_store(1, device_ptrs, cpu_spec)
     else:
-        assert worker.submit_load(1, cpu_spec, gpu_spec)
+        assert worker.submit_load(1, cpu_spec, device_ptrs)
     assert {x.job_id for x in handler._transfers} == {1}
 
     # wait for transfer to complete
@@ -601,15 +613,21 @@ def test_transfer(
             break
         time.sleep(0.1)
 
+    # determine src/dst by direction
+    if gpu_to_cpu:
+        src_tensors, dst_tensors = gpu_tensors, cpu_tensors
+        orig_src_tensors, orig_dst_tensors = orig_gpu_tensors, orig_cpu_tensors
+    else:
+        src_tensors, dst_tensors = cpu_tensors, gpu_tensors
+        orig_src_tensors, orig_dst_tensors = orig_cpu_tensors, orig_gpu_tensors
+
     # verify src tensors did not change
-    for orig_tensor, tensor in zip(orig_src_tensors, handler.src_tensors):
+    for orig_tensor, tensor in zip(orig_src_tensors, src_tensors):
         assert torch.equal(orig_tensor, tensor)
 
     # verify dst tensors at gpu-page granularity.
     for src_tensor, dst_tensor, orig_dst_tensor in zip(
-        handler.src_tensors,
-        handler.dst_tensors,
-        orig_dst_tensors,
+        src_tensors, dst_tensors, orig_dst_tensors
     ):
         # view both GPU and CPU tensors as (n, gpu_page_size_bytes) for comparison.
         src_view = src_tensor.reshape(-1, gpu_page_size_bytes)
@@ -628,6 +646,131 @@ def test_transfer(
     del src_view, dst_view, orig_dst_view, expected
 
     worker.shutdown()
+
+
+def _load_worker(
+    device: str, num_tensors: int, num_blocks: int, page_size: int
+) -> tuple[CPUOffloadingWorker, CanonicalKVCaches]:
+    kv_caches = CanonicalKVCaches(
+        tensors=[
+            CanonicalKVCacheTensor(
+                tensor=torch.zeros(
+                    (num_blocks, page_size), dtype=torch.int8, device=device
+                ),
+                page_size_bytes=page_size,
+            )
+            for _ in range(num_tensors)
+        ],
+        group_data_refs=[
+            [
+                CanonicalKVCacheRef(tensor_idx=i, page_size_bytes=page_size)
+                for i in range(num_tensors)
+            ]
+        ],
+    )
+    worker = CPUOffloadingWorker(
+        kv_caches=kv_caches, blocks_per_chunk=1, num_cpu_chunks=num_blocks
+    )
+    return worker, kv_caches
+
+
+def _submit_load(
+    worker: CPUOffloadingWorker,
+    kv_caches: CanonicalKVCaches,
+    job_id: int,
+    cpu_blocks: list[int],
+    gpu_blocks: list[int],
+) -> bool:
+    gpu_spec = GPULoadStoreSpec(gpu_blocks, (len(gpu_blocks),), (0,))
+    device_ptrs = resolve_device_pointers(gpu_spec, kv_caches)
+    return worker.submit_load(job_id, CPULoadStoreSpec(cpu_blocks), device_ptrs)
+
+
+def _poll_finished(worker: CPUOffloadingWorker, num_jobs: int) -> list[TransferResult]:
+    results: list[TransferResult] = []
+    deadline = time.time() + 10
+    while len(results) < num_jobs and time.time() < deadline:
+        results += worker.get_finished()
+        time.sleep(0.01)
+    return results
+
+
+@pytest.mark.parametrize("flush_with_wait", [False, True])
+@torch.inference_mode()
+def test_load_submitted_over_several_steps(
+    default_vllm_config, monkeypatch: pytest.MonkeyPatch, flush_with_wait: bool
+) -> None:
+    """A load larger than the per-step descriptor cap is submitted in slices
+    over several get_finished() calls (one per engine step), and is reported
+    only once its last slice has landed, with every block copied. A later load
+    still completes after it, and wait() (the flush fence) submits the rest at
+    once."""
+    num_tensors, num_blocks, page_size = 4, 16, 512
+    monkeypatch.setenv("VLLM_KV_OFFLOAD_MAX_LOAD_SUBMIT_DESCRIPTORS", "5")
+    worker, kv_caches = _load_worker(DEVICES[0], num_tensors, num_blocks, page_size)
+    cpu_tensors = list(worker._load_handler.cpu_tensors)
+    gpu_tensors = [t.tensor for t in kv_caches.tensors]
+    for tensor in cpu_tensors:
+        tensor.random_()
+
+    big_cpu, big_gpu = list(range(0, 9)), list(range(4, 13))
+    small_cpu, small_gpu = [12], [0]
+
+    def landed(cpu_blocks: list[int], gpu_blocks: list[int]) -> list[bool]:
+        return [
+            torch.equal(gpu[gpu_block].cpu(), cpu[cpu_block])
+            for cpu, gpu in zip(cpu_tensors, gpu_tensors)
+            for cpu_block, gpu_block in zip(cpu_blocks, gpu_blocks)
+        ]
+
+    assert _submit_load(worker, kv_caches, 1, big_cpu, big_gpu)
+    assert _submit_load(worker, kv_caches, 2, small_cpu, small_gpu)
+    # 36 descriptors with a cap of 5: the two calls submit 10 of them only
+    torch.accelerator.synchronize()
+    assert not all(landed(big_cpu, big_gpu))
+
+    if flush_with_wait:
+        worker.wait({1})
+        assert all(landed(big_cpu, big_gpu))
+    results = _poll_finished(worker, num_jobs=2)
+
+    assert [(r.job_id, r.success) for r in results] == [(1, True), (2, True)]
+    assert results[0].transfer_size == 9 * num_tensors * page_size
+    assert results[0].transfer_time is not None and results[0].transfer_time > 0
+    assert all(landed(big_cpu + small_cpu, big_gpu + small_gpu))
+    worker.shutdown()
+
+
+@torch.inference_mode()
+def test_shutdown_drains_partly_submitted_load(
+    default_vllm_config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """shutdown() returns only after every copy of a partly submitted load has
+    landed, so the caller may release the memory the load reads and writes."""
+    num_tensors, num_blocks, page_size = 4, 16, 512
+    monkeypatch.setenv("VLLM_KV_OFFLOAD_MAX_LOAD_SUBMIT_DESCRIPTORS", "5")
+    worker, kv_caches = _load_worker(DEVICES[0], num_tensors, num_blocks, page_size)
+    cpu_tensors = list(worker._load_handler.cpu_tensors)
+    gpu_tensors = [t.tensor for t in kv_caches.tensors]
+    for tensor in cpu_tensors:
+        tensor.random_()
+    blocks = list(range(9))
+
+    def landed() -> list[bool]:
+        return [
+            torch.equal(gpu[block].cpu(), cpu[block])
+            for cpu, gpu in zip(cpu_tensors, gpu_tensors)
+            for block in blocks
+        ]
+
+    assert _submit_load(worker, kv_caches, 1, blocks, blocks)
+    # 36 descriptors with a cap of 5: only the first slice is submitted
+    torch.accelerator.synchronize()
+    assert not all(landed())
+
+    worker.shutdown()
+
+    assert all(landed())
 
 
 @pytest.mark.parametrize("gpu_to_cpu", [True, False])
@@ -753,12 +896,15 @@ def test_transfer_multi_group(
     # block_indices: only relevant for unaligned transfers
     block_indices: list[int] = [0, 0, sub_blocks_to_skip]
 
+    # build specs and resolve device pointers
+    gpu_spec = GPULoadStoreSpec(
+        gpu_blocks, group_sizes=group_sizes, block_indices=block_indices
+    )
+    cpu_spec = CPULoadStoreSpec(cpu_chunks)
+    device_ptrs = resolve_device_pointers(gpu_spec, canonical_kv_caches)
+
+    handler = worker._store_handler if gpu_to_cpu else worker._load_handler
     if gpu_to_cpu:
-        handler = worker._store_handler
-        gpu_spec = GPULoadStoreSpec(
-            gpu_blocks, group_sizes=group_sizes, block_indices=block_indices
-        )
-        cpu_spec = CPULoadStoreSpec(cpu_chunks)
         # per-group mapping: cpu sub-block -> gpu sub-block
         dst_to_src_per_group = [
             dict(zip(expanded, gpu_blks))
@@ -768,11 +914,6 @@ def test_transfer_multi_group(
         ]
         num_dst_sub_blocks = num_cpu_chunks * blocks_per_chunk
     else:
-        handler = worker._load_handler
-        cpu_spec = CPULoadStoreSpec(cpu_chunks)
-        gpu_spec = GPULoadStoreSpec(
-            gpu_blocks, group_sizes=group_sizes, block_indices=block_indices
-        )
         # per-group mapping: gpu sub-block -> cpu sub-block
         dst_to_src_per_group = [
             dict(zip(gpu_blks, expanded))
@@ -782,19 +923,23 @@ def test_transfer_multi_group(
         ]
         num_dst_sub_blocks = num_gpu_blocks
 
-    # randomize src and dst tensors before transfer
-    for tensor in handler.src_tensors:
+    # collect gpu and cpu tensor lists for verification
+    gpu_tensors = [t.tensor for t in canonical_kv_caches.tensors]
+    cpu_tensors = handler.cpu_tensors
+
+    # randomize all tensors before transfer
+    for tensor in gpu_tensors:
         tensor.random_()
-    for tensor in handler.dst_tensors:
+    for tensor in cpu_tensors:
         tensor.random_()
 
-    orig_src_tensors = [x.clone() for x in handler.src_tensors]
-    orig_dst_tensors = [x.clone() for x in handler.dst_tensors]
+    orig_gpu_tensors = [x.clone() for x in gpu_tensors]
+    orig_cpu_tensors = [x.clone() for x in cpu_tensors]
 
     if gpu_to_cpu:
-        assert worker.submit_store(1, gpu_spec, cpu_spec)
+        assert worker.submit_store(1, device_ptrs, cpu_spec)
     else:
-        assert worker.submit_load(1, cpu_spec, gpu_spec)
+        assert worker.submit_load(1, cpu_spec, device_ptrs)
     assert {x.job_id for x in handler._transfers} == {1}
 
     end_time = time.time() + 10
@@ -813,16 +958,24 @@ def test_transfer_multi_group(
             break
         time.sleep(0.1)
 
+    # determine src/dst by direction
+    if gpu_to_cpu:
+        src_tensors, dst_tensors = gpu_tensors, cpu_tensors
+        orig_src_tensors, orig_dst_tensors = orig_gpu_tensors, orig_cpu_tensors
+    else:
+        src_tensors, dst_tensors = cpu_tensors, gpu_tensors
+        orig_src_tensors, orig_dst_tensors = orig_cpu_tensors, orig_gpu_tensors
+
     # verify src tensors did not change
-    for orig_tensor, tensor in zip(orig_src_tensors, handler.src_tensors):
+    for orig_tensor, tensor in zip(orig_src_tensors, src_tensors):
         assert torch.equal(orig_tensor, tensor)
 
     # verify dst tensors at gpu-page granularity
     for group_idx, dst_to_src in enumerate(dst_to_src_per_group):
         group_tensor_offset = group_idx * tensors_per_group
         for tensor_idx in range(tensors_per_group):
-            src_tensor = handler.src_tensors[group_tensor_offset + tensor_idx]
-            dst_tensor = handler.dst_tensors[group_tensor_offset + tensor_idx]
+            src_tensor = src_tensors[group_tensor_offset + tensor_idx]
+            dst_tensor = dst_tensors[group_tensor_offset + tensor_idx]
             orig_dst_tensor = orig_dst_tensors[group_tensor_offset + tensor_idx]
             src_view = src_tensor.view(-1, gpu_page_size_bytes)
             dst_view = dst_tensor.view(-1, gpu_page_size_bytes)
@@ -857,21 +1010,20 @@ def test_load_waits_for_pending_compute_stream_writes(default_vllm_config) -> No
         (num_blocks, page_size_bytes), dtype=torch.int8, device=device
     )
     loaded_block_ids = torch.tensor(loaded_blocks, dtype=torch.long, device=device)
+    kv_caches = CanonicalKVCaches(
+        tensors=[
+            CanonicalKVCacheTensor(tensor=gpu_tensor, page_size_bytes=page_size_bytes)
+        ],
+        group_data_refs=[
+            [CanonicalKVCacheRef(tensor_idx=0, page_size_bytes=page_size_bytes)]
+        ],
+    )
     worker = CPUOffloadingWorker(
-        kv_caches=CanonicalKVCaches(
-            tensors=[
-                CanonicalKVCacheTensor(
-                    tensor=gpu_tensor, page_size_bytes=page_size_bytes
-                )
-            ],
-            group_data_refs=[
-                [CanonicalKVCacheRef(tensor_idx=0, page_size_bytes=page_size_bytes)]
-            ],
-        ),
+        kv_caches=kv_caches,
         blocks_per_chunk=1,
         num_cpu_chunks=num_blocks,
     )
-    worker._load_handler.src_tensors[0].fill_(sentinel)
+    worker._load_handler.cpu_tensors[0].fill_(sentinel)
     expected = torch.full((page_size_bytes,), sentinel, dtype=torch.int8)
 
     try:
@@ -885,14 +1037,16 @@ def test_load_waits_for_pending_compute_stream_writes(default_vllm_config) -> No
             torch.cuda._sleep(50_000_000)
             gpu_tensor.index_fill_(0, loaded_block_ids, 0)
 
+            gpu_spec = GPULoadStoreSpec(
+                loaded_blocks,
+                group_sizes=(len(loaded_blocks),),
+                block_indices=(0,),
+            )
+            device_ptrs = resolve_device_pointers(gpu_spec, kv_caches)
             assert worker.submit_load(
                 trial + 1,
                 CPULoadStoreSpec(loaded_blocks),
-                GPULoadStoreSpec(
-                    loaded_blocks,
-                    group_sizes=(len(loaded_blocks),),
-                    block_indices=(0,),
-                ),
+                device_ptrs,
             )
             deadline = time.time() + 10
             finished: list[TransferResult] = []
@@ -930,17 +1084,16 @@ def test_device_fault_does_not_fail_the_next_kernel_launch(
     gpu_tensor = torch.zeros(
         (num_blocks, page_size_bytes), dtype=torch.int8, device=DEVICES[0]
     )
+    kv_caches = CanonicalKVCaches(
+        tensors=[
+            CanonicalKVCacheTensor(tensor=gpu_tensor, page_size_bytes=page_size_bytes)
+        ],
+        group_data_refs=[
+            [CanonicalKVCacheRef(tensor_idx=0, page_size_bytes=page_size_bytes)]
+        ],
+    )
     worker = CPUOffloadingWorker(
-        kv_caches=CanonicalKVCaches(
-            tensors=[
-                CanonicalKVCacheTensor(
-                    tensor=gpu_tensor, page_size_bytes=page_size_bytes
-                )
-            ],
-            group_data_refs=[
-                [CanonicalKVCacheRef(tensor_idx=0, page_size_bytes=page_size_bytes)]
-            ],
-        ),
+        kv_caches=kv_caches,
         blocks_per_chunk=1,
         num_cpu_chunks=num_blocks,
     )
@@ -960,12 +1113,13 @@ def test_device_fault_does_not_fail_the_next_kernel_launch(
     gpu_spec = GPULoadStoreSpec(
         list(range(num_blocks)), group_sizes=(num_blocks,), block_indices=(0,)
     )
+    device_ptrs = resolve_device_pointers(gpu_spec, kv_caches)
     cpu_spec = CPULoadStoreSpec(list(range(num_blocks)))
     try:
         if gpu_to_cpu:
-            assert worker.submit_store(1, gpu_spec, cpu_spec)
+            assert worker.submit_store(1, device_ptrs, cpu_spec)
         else:
-            assert worker.submit_load(1, cpu_spec, gpu_spec)
+            assert worker.submit_load(1, cpu_spec, device_ptrs)
         if not faulted:
             pytest.skip("this runtime accepts zero-size copies")
 
